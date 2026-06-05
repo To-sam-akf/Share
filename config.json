@@ -1,0 +1,9 @@
+{
+  "device_name": "Sam",
+  "udp_port": 9000,
+  "tcp_port": 9001,
+  "broadcast_ip": "255.255.255.255",
+  "shared_folder": "./shared_folder",
+  "chunk_size": 1048576,
+  "enable_tls": false
+}
