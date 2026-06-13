@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import mimetypes
 import os
 import queue
 import threading
@@ -26,9 +27,42 @@ from discovery.udp_discovery import get_local_ip
 from security import TLSPolicy, SecurityStore, ensure_tls_identity
 from security.pairing import pair_with_device
 from sync import STATUS_ACTIVE, STATUS_DELETED, ConflictRecord, FileEntry, FileIndex
-from sync.paths import destination_for
+from sync.paths import destination_for, normalize_relative_path
 from sync.service import SyncService
 from transfer import TCPFileServer, TransferError, send_file
+
+
+INLINE_IMAGE_TYPES = {
+    "image/avif",
+    "image/bmp",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+}
+UNSAFE_INLINE_TEXT_TYPES = {
+    "application/xhtml+xml",
+    "application/xml",
+    "text/html",
+    "text/xml",
+}
+
+
+def file_preview_kind(file_name: str) -> str | None:
+    media_type, _ = mimetypes.guess_type(file_name)
+    if media_type == "application/pdf":
+        return "pdf"
+    if media_type in INLINE_IMAGE_TYPES:
+        return "image"
+    if media_type == "application/json":
+        return "text"
+    if (
+        media_type
+        and media_type.startswith("text/")
+        and media_type not in UNSAFE_INLINE_TEXT_TYPES
+    ):
+        return "text"
+    return None
 
 
 RESTART_FIELDS = {
@@ -616,11 +650,35 @@ class AppRuntime:
                 {
                     **asdict(entry),
                     "sync_status": sync_status,
+                    "preview_kind": (
+                        file_preview_kind(entry.file_name)
+                        if entry.status == STATUS_ACTIVE
+                        else None
+                    ),
                 }
             )
         total = len(rows)
         page = rows[max(0, offset) : max(0, offset) + max(1, min(limit, 200))]
         return {"items": page, "total": total}
+
+    def shared_file_path(self, relative_path: str) -> tuple[FileEntry, Path]:
+        normalized = normalize_relative_path(relative_path)
+        try:
+            destination_for(self.config.shared_folder, normalized)
+        except ValueError as exc:
+            raise FileNotFoundError(normalized) from exc
+
+        entry = self.file_index.refresh_path(normalized)
+        if entry is None or entry.status != STATUS_ACTIVE:
+            raise FileNotFoundError(normalized)
+
+        try:
+            path = destination_for(self.config.shared_folder, normalized)
+        except ValueError as exc:
+            raise FileNotFoundError(normalized) from exc
+        if not path.is_file() or path.is_symlink():
+            raise FileNotFoundError(normalized)
+        return entry, path
 
     def _file_sync_status(
         self,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time
 import uuid
 from typing import Any, Literal, TypedDict
@@ -15,7 +16,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
 from .model_factory import create_chat_model
-from .store import AgentRunStore
+from .store import AgentRunStore, AgentThreadActiveError
 from .sync_tools import SyncCoordinator
 
 
@@ -41,14 +42,23 @@ class ReActSyncAgent:
             runtime.config.shared_folder / ".lan-sync" / "agent-checkpoints.sqlite3"
         )
         self._tasks: dict[str, asyncio.Task] = {}
+        self._deleting_threads: set[str] = set()
 
     def create_run(self, message: str, thread_id: str = "") -> dict[str, Any]:
         request = str(message).strip()
         if not request:
             raise ValueError("message must not be empty")
         run_id = uuid.uuid4().hex
-        actual_thread_id = str(thread_id).strip() or uuid.uuid4().hex
-        self.store.create_run(run_id, actual_thread_id, request)
+        requested_thread_id = str(thread_id).strip()
+        actual_thread_id = requested_thread_id or uuid.uuid4().hex
+        if actual_thread_id in self._deleting_threads:
+            raise AgentThreadActiveError("agent thread is being deleted")
+        self.store.create_run(
+            run_id,
+            actual_thread_id,
+            request,
+            require_existing_thread=bool(requested_thread_id),
+        )
         self._schedule(run_id, None)
         payload = self.store.get_run(run_id)
         assert payload is not None
@@ -83,8 +93,65 @@ class ReActSyncAgent:
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         return self.store.get_run(run_id)
 
-    def list_threads(self, limit: int = 50) -> list[dict[str, Any]]:
-        return self.store.list_threads(limit)
+    def list_threads(self, limit: int = 50, cursor: str = "") -> dict[str, Any]:
+        return self.store.list_threads(limit, cursor)
+
+    def get_thread(
+        self,
+        thread_id: str,
+        *,
+        limit: int = 50,
+        cursor: str = "",
+    ) -> dict[str, Any] | None:
+        return self.store.get_thread(thread_id, limit=limit, cursor=cursor)
+
+    def rename_thread(self, thread_id: str, title: str) -> dict[str, Any]:
+        return self.store.rename_thread(thread_id, title)
+
+    async def delete_thread(self, thread_id: str) -> None:
+        normalized = str(thread_id).strip()
+        if normalized in self._deleting_threads:
+            raise AgentThreadActiveError("agent thread is being deleted")
+        run_ids = self.store.thread_run_ids_for_delete(normalized)
+        self._deleting_threads.add(normalized)
+        try:
+            pending_tasks = [
+                task
+                for run_id in run_ids
+                if (task := self._tasks.get(run_id)) is not None
+                and not task.done()
+            ]
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            if self.checkpoint_path.exists() and run_ids:
+                self._delete_checkpoints(run_ids)
+            self.store.delete_thread(normalized)
+        finally:
+            self._deleting_threads.discard(normalized)
+
+    def _delete_checkpoints(self, run_ids: list[str]) -> None:
+        placeholders = ", ".join("?" for _ in run_ids)
+        with sqlite3.connect(self.checkpoint_path, timeout=30.0) as connection:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    """
+                    SELECT name
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name IN ('checkpoints', 'writes')
+                    """
+                )
+            }
+            if "checkpoints" in tables:
+                connection.execute(
+                    f"DELETE FROM checkpoints WHERE thread_id IN ({placeholders})",
+                    run_ids,
+                )
+            if "writes" in tables:
+                connection.execute(
+                    f"DELETE FROM writes WHERE thread_id IN ({placeholders})",
+                    run_ids,
+                )
 
     def _schedule(self, run_id: str, command: Command | None) -> None:
         existing = self._tasks.get(run_id)

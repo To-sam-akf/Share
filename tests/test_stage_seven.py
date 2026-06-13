@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agents.orchestrator import ReActSyncAgent
-from agents.store import AgentRunStore
+from agents.store import AgentRunStore, AgentThreadActiveError
 from agents.sync_tools import SyncCoordinator, normalize_path_prefix
 from discovery import DiscoveredDevice
 from security import PERMISSION_WRITE, SecurityStore
@@ -44,6 +45,166 @@ class StaticDiscovery:
 
 
 class StageSevenSyncAgentTests(unittest.TestCase):
+    def test_agent_threads_backfill_paginate_rename_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            store = AgentRunStore(folder)
+            store.create_run("run-a1", "thread-a", "first request")
+            store.update_run("run-a1", status="completed", report="first report")
+            store.create_run("run-a2", "thread-a", "second request")
+            store.update_run("run-a2", status="completed", report="second report")
+            store.create_run("run-b1", "thread-b", "other request")
+            store.update_run("run-b1", status="completed", report="other report")
+
+            first_page = store.list_threads(limit=1)
+            self.assertEqual(len(first_page["items"]), 1)
+            self.assertIsNotNone(first_page["next_cursor"])
+            second_page = store.list_threads(
+                limit=1,
+                cursor=first_page["next_cursor"],
+            )
+            self.assertEqual(len(second_page["items"]), 1)
+            self.assertNotEqual(
+                first_page["items"][0]["thread_id"],
+                second_page["items"][0]["thread_id"],
+            )
+
+            detail = store.get_thread("thread-a", limit=1)
+            self.assertEqual(
+                [message["content"] for message in detail["messages"]],
+                ["second request", "second report"],
+            )
+            older = store.get_thread(
+                "thread-a",
+                limit=1,
+                cursor=detail["next_cursor"],
+            )
+            self.assertEqual(
+                [message["content"] for message in older["messages"]],
+                ["first request", "first report"],
+            )
+
+            renamed = store.rename_thread("thread-a", "  Renamed thread  ")
+            self.assertEqual(renamed["title"], "Renamed thread")
+            store.append_step(
+                "run-a1",
+                kind="test",
+                name="step",
+                status="success",
+            )
+            store.save_plan("plan-a", "run-a1", {"plan_id": "plan-a"})
+            store.delete_thread("thread-a")
+            self.assertIsNone(store.get_thread("thread-a"))
+            with sqlite3.connect(store.database_path) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM agent_steps WHERE run_id LIKE 'run-a%'"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM sync_plans WHERE run_id LIKE 'run-a%'"
+                    ).fetchone()[0],
+                    0,
+                )
+
+            with sqlite3.connect(store.database_path) as connection:
+                connection.execute(
+                    "DELETE FROM agent_threads WHERE thread_id = 'thread-b'"
+                )
+            reloaded = AgentRunStore(folder)
+            backfilled = reloaded.get_thread("thread-b")
+            self.assertEqual(backfilled["thread"]["title"], "other request")
+
+    def test_agent_thread_rejects_concurrent_run_and_active_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = AgentRunStore(Path(tmp))
+            store.create_run("run-active", "thread-active", "first")
+            with self.assertRaises(AgentThreadActiveError):
+                store.create_run("run-second", "thread-active", "second")
+            with self.assertRaises(AgentThreadActiveError):
+                store.thread_run_ids_for_delete("thread-active")
+            with self.assertRaises(AgentThreadActiveError):
+                store.delete_thread("thread-active")
+            with self.assertRaises(KeyError):
+                store.create_run(
+                    "run-missing",
+                    "missing-thread",
+                    "missing",
+                    require_existing_thread=True,
+                )
+
+    def test_agent_thread_delete_removes_langgraph_checkpoints(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                folder = Path(tmp)
+                runtime = SimpleNamespace(
+                    config=SimpleNamespace(shared_folder=folder),
+                    events=SimpleNamespace(publish=lambda *_: None),
+                )
+                agent = ReActSyncAgent(runtime)
+                agent.store.create_run("run-delete", "thread-delete", "done")
+                agent.store.update_run("run-delete", status="completed")
+                with sqlite3.connect(agent.checkpoint_path) as connection:
+                    connection.executescript(
+                        """
+                        CREATE TABLE checkpoints (
+                            thread_id TEXT NOT NULL,
+                            checkpoint_ns TEXT NOT NULL DEFAULT '',
+                            checkpoint_id TEXT NOT NULL,
+                            PRIMARY KEY (
+                                thread_id, checkpoint_ns, checkpoint_id
+                            )
+                        );
+                        CREATE TABLE writes (
+                            thread_id TEXT NOT NULL,
+                            checkpoint_ns TEXT NOT NULL DEFAULT '',
+                            checkpoint_id TEXT NOT NULL,
+                            task_id TEXT NOT NULL,
+                            idx INTEGER NOT NULL,
+                            channel TEXT NOT NULL,
+                            PRIMARY KEY (
+                                thread_id, checkpoint_ns, checkpoint_id,
+                                task_id, idx
+                            )
+                        );
+                        """
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO checkpoints (
+                            thread_id, checkpoint_ns, checkpoint_id
+                        ) VALUES (?, '', 'checkpoint')
+                        """,
+                        ("run-delete",),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO writes (
+                            thread_id, checkpoint_ns, checkpoint_id,
+                            task_id, idx, channel
+                        ) VALUES (?, '', 'checkpoint', 'task', 0, 'channel')
+                        """,
+                        ("run-delete",),
+                    )
+
+                await agent.delete_thread("thread-delete")
+                self.assertIsNone(agent.get_thread("thread-delete"))
+                with sqlite3.connect(agent.checkpoint_path) as connection:
+                    self.assertEqual(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM checkpoints"
+                        ).fetchone()[0],
+                        0,
+                    )
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM writes").fetchone()[0],
+                        0,
+                    )
+
+        asyncio.run(scenario())
+
     def test_connection_diagnosis_takes_priority_over_device_listing(self) -> None:
         self.assertTrue(ReActSyncAgent._is_analysis_request("诊断在线设备"))
         self.assertFalse(ReActSyncAgent._is_device_query_request("诊断在线设备"))

@@ -8,6 +8,8 @@ import {
   CircleDot,
   Clock3,
   CloudUpload,
+  Download,
+  ExternalLink,
   FileDiff,
   FileText,
   Fingerprint,
@@ -20,7 +22,10 @@ import {
   LockKeyhole,
   Menu,
   Network,
+  PanelLeft,
+  Pencil,
   Play,
+  Plus,
   RefreshCw,
   Router,
   Search,
@@ -31,6 +36,7 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   TerminalSquare,
+  Trash2,
   Unplug,
   UserRoundCheck,
   Wifi,
@@ -48,10 +54,20 @@ import {
 } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { api, eventSocket, uploadFile } from "./api";
+import {
+  api,
+  eventSocket,
+  fileContentUrl,
+  saveSharedFile,
+  uploadFile
+} from "./api";
 import type {
   AgentResult,
+  AgentMessage,
   AgentRun,
+  AgentThreadDetail,
+  AgentThreadPage,
+  AgentThreadSummary,
   AuditAlert,
   AuditEvent,
   Conflict,
@@ -695,6 +711,8 @@ export function SyncPage({
   const [deviceId, setDeviceId] = useState("");
   const [uploadProgress, setUploadProgress] = useState<number | null>(null);
   const [actionError, setActionError] = useState("");
+  const [fileActionError, setFileActionError] = useState("");
+  const [savingPath, setSavingPath] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
   const files = useRemote(
     () =>
@@ -731,6 +749,24 @@ export function SyncPage({
   const runSync = async () => {
     await api("/api/sync/run", { method: "POST" });
     notify("已触发一次完整扫描与同步");
+  };
+  const saveFile = async (entry: FileEntry) => {
+    setFileActionError("");
+    setSavingPath(entry.relative_path);
+    try {
+      const result = await saveSharedFile(entry.relative_path, entry.file_name);
+      if (result === "saved") {
+        notify("文件已保存到所选目录");
+      } else if (result === "downloaded") {
+        notify("文件已交给浏览器下载");
+      }
+    } catch (reason) {
+      setFileActionError(
+        reason instanceof Error ? reason.message : "文件保存失败"
+      );
+    } finally {
+      setSavingPath("");
+    }
   };
   const pairedOnline = (devices.data?.items ?? []).filter(
     (item) => item.online && item.paired && !["blocked", "read"].includes(item.permission)
@@ -821,6 +857,7 @@ export function SyncPage({
       <section className="content-grid">
         <Panel className="span-8">
           <PanelTitle eyebrow="FILE INDEX" title={`文件索引 · ${files.data?.total ?? 0}`} />
+          {fileActionError && <InlineError message={fileActionError} />}
           <div className="filter-row">
             <label className="search-box">
               <Search size={16} />
@@ -853,6 +890,7 @@ export function SyncPage({
                   <th>来源</th>
                   <th>修改时间</th>
                   <th>状态</th>
+                  <th className="row-actions">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -864,6 +902,32 @@ export function SyncPage({
                     <td>{entry.source_device_name || shortId(entry.source_device_id)}</td>
                     <td>{formatTime(entry.modified_time_ns)}</td>
                     <td><SyncBadge status={entry.sync_status} /></td>
+                    <td className="row-actions">
+                      {entry.status === "active" && (
+                        <div className="file-actions">
+                          {entry.preview_kind && (
+                            <a
+                              className="button ghost small"
+                              href={fileContentUrl(entry.relative_path, "inline")}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              <ExternalLink size={15} />
+                              打开
+                            </a>
+                          )}
+                          <Button
+                            size="small"
+                            variant="secondary"
+                            icon={savingPath === entry.relative_path ? LoaderCircle : Download}
+                            disabled={Boolean(savingPath)}
+                            onClick={() => saveFile(entry)}
+                          >
+                            {savingPath === entry.relative_path ? "保存中" : "另存为"}
+                          </Button>
+                        </div>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -1102,10 +1166,22 @@ export function AgentsPage({
   liveVersion?: number;
   notify: (message: string) => void;
 }) {
+  const [threads, setThreads] = useState<AgentThreadSummary[]>([]);
+  const [threadsCursor, setThreadsCursor] = useState<string | null>(null);
+  const [threadsLoading, setThreadsLoading] = useState(true);
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<AgentMessage[]>([]);
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
+  const [threadLoading, setThreadLoading] = useState(false);
   const [run, setRun] = useState<AgentRun | null>(null);
   const [message, setMessage] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  const [sessionDrawerOpen, setSessionDrawerOpen] = useState(false);
+  const [editingThreadId, setEditingThreadId] = useState("");
+  const [editingTitle, setEditingTitle] = useState("");
+  const selectedThreadRef = useRef<string | null>(null);
+  const messageListRef = useRef<HTMLDivElement>(null);
   const agents = [
     {
       id: "connection",
@@ -1130,19 +1206,98 @@ export function AgentsPage({
     }
   ];
 
-  const refresh = useCallback(async (runId: string) => {
-    const response = await api<AgentRun>(`/api/agent/runs/${runId}`);
-    setRun(response);
-    return response;
+  const fetchThreads = useCallback(async (cursor = "", replace = true) => {
+    setThreadsLoading(true);
+    try {
+      const query = new URLSearchParams({ limit: "50" });
+      if (cursor) query.set("cursor", cursor);
+      const response = await api<AgentThreadPage>(
+        `/api/agent/threads?${query.toString()}`
+      );
+      setThreads((current) => replace
+        ? response.items
+        : [...current, ...response.items]
+      );
+      setThreadsCursor(response.next_cursor);
+    } finally {
+      setThreadsLoading(false);
+    }
+  }, []);
+
+  const loadThread = useCallback(async (threadId: string) => {
+    setThreadLoading(true);
+    try {
+      const response = await api<AgentThreadDetail>(
+        `/api/agent/threads/${encodeURIComponent(threadId)}?limit=50`
+      );
+      if (selectedThreadRef.current !== threadId) return;
+      setMessages(response.messages);
+      setHistoryCursor(response.next_cursor);
+      setRun(response.latest_run);
+      window.requestAnimationFrame(() => {
+        if (messageListRef.current) {
+          messageListRef.current.scrollTop = messageListRef.current.scrollHeight;
+        }
+      });
+    } finally {
+      if (selectedThreadRef.current === threadId) setThreadLoading(false);
+    }
   }, []);
 
   useEffect(() => {
-    if (!run || ["completed", "rejected", "failed"].includes(run.status)) return;
+    void fetchThreads().catch((reason) => {
+      setError(reason instanceof Error ? reason.message : "无法加载 Agent 会话");
+    });
+  }, [fetchThreads]);
+
+  useEffect(() => {
+    if (!liveVersion) return;
+    void fetchThreads().catch(() => undefined);
+  }, [liveVersion, fetchThreads]);
+
+  const openThread = (threadId: string) => {
+    selectedThreadRef.current = threadId;
+    setSelectedThreadId(threadId);
+    setMessages([]);
+    setHistoryCursor(null);
+    setRun(null);
+    setError("");
+    setSessionDrawerOpen(false);
+    void loadThread(threadId).catch((reason) => {
+      if (selectedThreadRef.current === threadId) {
+        setError(reason instanceof Error ? reason.message : "无法加载 Agent 会话");
+      }
+    });
+  };
+
+  const newThread = () => {
+    selectedThreadRef.current = null;
+    setSelectedThreadId(null);
+    setMessages([]);
+    setHistoryCursor(null);
+    setRun(null);
+    setMessage("");
+    setError("");
+    setSessionDrawerOpen(false);
+  };
+
+  const refresh = useCallback(async (runId: string, threadId: string) => {
+    const response = await api<AgentRun>(`/api/agent/runs/${runId}`);
+    if (selectedThreadRef.current !== threadId) return response;
+    setRun(response);
+    if (!isAgentRunActive(response.status)) {
+      await Promise.all([loadThread(threadId), fetchThreads()]);
+    }
+    return response;
+  }, [fetchThreads, loadThread]);
+
+  useEffect(() => {
+    if (!run || !selectedThreadId || !isAgentRunActive(run.status)) return;
     const timer = window.setInterval(() => {
-      void refresh(run.run_id).catch(() => undefined);
+      void refresh(run.run_id, selectedThreadId).catch(() => undefined);
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [run?.run_id, run?.status, liveVersion, refresh]);
+  }, [run?.run_id, run?.status, selectedThreadId, liveVersion, refresh]);
 
   const startRun = async (request: string) => {
     const trimmed = request.trim();
@@ -1154,12 +1309,27 @@ export function AgentsPage({
         method: "POST",
         body: JSON.stringify({
           message: trimmed,
-          thread_id: run?.thread_id || ""
+          thread_id: selectedThreadId || ""
         })
       });
+      selectedThreadRef.current = response.thread_id;
+      setSelectedThreadId(response.thread_id);
       setRun(response);
+      setMessages((current) => {
+        const retained = selectedThreadId ? current : [];
+        return [...retained, ...response.messages];
+      });
       setMessage("");
       notify("Agent 任务已启动");
+      try {
+        await Promise.all([loadThread(response.thread_id), fetchThreads()]);
+      } catch (refreshError) {
+        setError(
+          refreshError instanceof Error
+            ? refreshError.message
+            : "任务已启动，但会话刷新失败"
+        );
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法启动 Agent");
     } finally {
@@ -1214,7 +1384,81 @@ export function AgentsPage({
     }
   };
 
+  const loadEarlier = async () => {
+    if (!selectedThreadId || !historyCursor || threadLoading) return;
+    const threadId = selectedThreadId;
+    const list = messageListRef.current;
+    const previousHeight = list?.scrollHeight || 0;
+    setThreadLoading(true);
+    try {
+      const query = new URLSearchParams({
+        limit: "50",
+        cursor: historyCursor
+      });
+      const response = await api<AgentThreadDetail>(
+        `/api/agent/threads/${encodeURIComponent(threadId)}?${query.toString()}`
+      );
+      if (selectedThreadRef.current !== threadId) return;
+      setMessages((current) => [...response.messages, ...current]);
+      setHistoryCursor(response.next_cursor);
+      window.requestAnimationFrame(() => {
+        if (messageListRef.current) {
+          messageListRef.current.scrollTop =
+            messageListRef.current.scrollHeight - previousHeight;
+        }
+      });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法加载更早的消息");
+    } finally {
+      if (selectedThreadRef.current === threadId) setThreadLoading(false);
+    }
+  };
+
+  const saveThreadTitle = async (threadId: string) => {
+    const title = editingTitle.trim();
+    if (!title) return;
+    setSubmitting(true);
+    try {
+      await api<AgentThreadSummary>(
+        `/api/agent/threads/${encodeURIComponent(threadId)}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ title })
+        }
+      );
+      setEditingThreadId("");
+      await fetchThreads();
+      notify("会话名称已更新");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法修改会话名称");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const deleteThread = async (thread: AgentThreadSummary) => {
+    if (!window.confirm(`永久删除会话“${thread.title}”及其全部记录？`)) return;
+    setSubmitting(true);
+    try {
+      await api<{ status: string }>(
+        `/api/agent/threads/${encodeURIComponent(thread.thread_id)}`,
+        { method: "DELETE" }
+      );
+      if (selectedThreadRef.current === thread.thread_id) newThread();
+      await fetchThreads();
+      notify("会话已删除");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法删除会话");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   const selectionDevices = agentSelectionDevices(run);
+  const activeRun = isAgentRunActive(run?.status);
+  const selectedThread = threads.find(
+    (thread) => thread.thread_id === selectedThreadId
+  );
 
   return (
     <Page>
@@ -1223,112 +1467,230 @@ export function AgentsPage({
         title="ReAct 同步 Agent"
         description="Agent 会自主查询设备和索引、生成确定性计划，并在文件传输前等待你的批准。"
       />
-      <section className="agent-preset-grid">
-        {agents.map((agent) => {
-          const Icon = agent.icon;
-          return <button
-              className="agent-preset"
-              key={agent.id}
-              onClick={() => void startRun(agent.prompt)}
-              disabled={submitting}
-            >
-              <Icon size={27} />
-              <span><strong>{agent.title}</strong>{agent.description}</span>
-              <Play size={16} />
-            </button>;
-        })}
-      </section>
-
-      <section className="agent-workspace">
-        <Panel className="agent-chat">
-          <PanelTitle eyebrow="USER REQUEST" title="任务对话" />
-          <div className="agent-messages">
-            {run?.messages.map((item, index) => (
-              <article className={`agent-message ${item.role}`} key={`${item.role}-${index}`}>
-                <span>{item.role === "user" ? "你" : "Agent"}</span>
-                {item.role === "assistant" ? (
-                  <AgentMarkdown content={item.content} />
+      <button
+        className="agent-session-toggle"
+        onClick={() => setSessionDrawerOpen(true)}
+      >
+        <PanelLeft size={16} />
+        会话列表
+      </button>
+      {sessionDrawerOpen && (
+        <button
+          className="agent-session-scrim"
+          aria-label="关闭会话列表"
+          onClick={() => setSessionDrawerOpen(false)}
+        />
+      )}
+      <section className="agent-session-layout">
+        <aside className={`agent-session-sidebar ${sessionDrawerOpen ? "open" : ""}`}>
+          <div className="agent-session-head">
+            <div><span className="eyebrow">SESSIONS</span><strong>Agent 会话</strong></div>
+            <button className="icon-button" aria-label="关闭会话列表" onClick={() => setSessionDrawerOpen(false)}>
+              <X size={16} />
+            </button>
+          </div>
+          <button className="agent-new-session" onClick={newThread}>
+            <Plus size={16} />
+            新会话
+          </button>
+          <div className="agent-session-list">
+            {threads.map((thread) => (
+              <article
+                className={`agent-session-item ${selectedThreadId === thread.thread_id ? "active" : ""}`}
+                key={thread.thread_id}
+              >
+                {editingThreadId === thread.thread_id ? (
+                  <form
+                    className="agent-session-edit"
+                    onSubmit={(event) => {
+                      event.preventDefault();
+                      void saveThreadTitle(thread.thread_id);
+                    }}
+                  >
+                    <input
+                      aria-label="会话名称"
+                      maxLength={80}
+                      value={editingTitle}
+                      onChange={(event) => setEditingTitle(event.target.value)}
+                      autoFocus
+                    />
+                    <button aria-label="保存会话名称" disabled={!editingTitle.trim() || submitting}>
+                      <Check size={14} />
+                    </button>
+                    <button type="button" aria-label="取消修改" onClick={() => setEditingThreadId("")}>
+                      <X size={14} />
+                    </button>
+                  </form>
                 ) : (
-                  <p>{item.content}</p>
+                  <>
+                    <button className="agent-session-select" onClick={() => openThread(thread.thread_id)}>
+                      <strong>{thread.title}</strong>
+                      <span>
+                        {thread.run_count} 轮 · {formatTime(thread.updated_at_ns)}
+                      </span>
+                    </button>
+                    <div className="agent-session-actions">
+                      <Badge tone={agentStatusTone(thread.status || undefined)}>
+                        {agentStatusLabel(thread.status || undefined)}
+                      </Badge>
+                      <button
+                        aria-label={`重命名 ${thread.title}`}
+                        onClick={() => {
+                          setEditingThreadId(thread.thread_id);
+                          setEditingTitle(thread.title);
+                        }}
+                      >
+                        <Pencil size={13} />
+                      </button>
+                      <button
+                        aria-label={`删除 ${thread.title}`}
+                        disabled={isAgentRunActive(thread.status)}
+                        onClick={() => void deleteThread(thread)}
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
+                  </>
                 )}
               </article>
             ))}
-            {!run && (
-              <EmptyState
-                icon={Bot}
-                title="描述一个同步任务"
-                description="例如：同步 PC-B 的 notes 文件夹。Agent 会先规划，不会直接传输。"
-              />
+            {!threads.length && !threadsLoading && (
+              <p className="agent-session-empty">暂无历史会话</p>
             )}
           </div>
-          <form className="agent-composer" onSubmit={submit}>
-            <textarea
-              aria-label="Agent 任务"
-              value={message}
-              onChange={(event) => setMessage(event.target.value)}
-              placeholder="输入设备名称和目录，例如：同步 PC-B 的 notes 文件夹"
-              rows={3}
-            />
-            <Button
-              type="submit"
-              icon={submitting ? LoaderCircle : Send}
-              disabled={submitting || !message.trim()}
+          {threadsCursor && (
+            <button
+              className="agent-load-more"
+              disabled={threadsLoading}
+              onClick={() => void fetchThreads(threadsCursor, false)}
             >
-              {submitting ? "提交中" : "发送任务"}
-            </Button>
-          </form>
-        </Panel>
+              {threadsLoading ? "加载中…" : "加载更多会话"}
+            </button>
+          )}
+        </aside>
 
-        <Panel className="agent-trace">
-          <PanelTitle eyebrow="REACT TRACE" title="执行步骤" />
-          <div className="agent-run-head">
-            <Badge tone={agentStatusTone(run?.status)}>
-              {run?.status === "waiting_approval" && !run.plan
-                ? "等待选择"
-                : agentStatusLabel(run?.status)}
-            </Badge>
-            {run && <code>{run.run_id.slice(0, 12)}</code>}
+        <div className="agent-session-content">
+          <div className="agent-session-toolbar">
+            <div>
+              <span className="eyebrow">CURRENT SESSION</span>
+              <strong>{selectedThread?.title || "新会话"}</strong>
+            </div>
+            {activeRun && <Badge tone={agentStatusTone(run?.status)}>{agentStatusLabel(run?.status)}</Badge>}
           </div>
-          <div className="agent-timeline">
-            {run?.steps.map((step, index) => (
-              <article className="agent-step" key={`${step.created_at_ns}-${index}`}>
-                <span className={`step-dot ${step.status}`} />
-                <div>
-                  <strong>{toolLabel(step.name)}</strong>
-                  <span>{step.kind} / {step.status}</span>
-                  {step.kind === "observation" && (
-                    <pre>{compactJson(step.output)}</pre>
-                  )}
-                </div>
-              </article>
-            ))}
-            {run && !run.steps.length && <p className="muted-copy">等待 Planner 启动。</p>}
-          </div>
-        </Panel>
-      </section>
 
-      {run?.status === "waiting_approval" && !run.plan && selectionDevices.length > 0 && (
-        <Panel>
-          <PanelTitle eyebrow="CLARIFICATION" title="请选择目标设备" />
-          <div className="device-choice-grid">
-            {selectionDevices.map((device) => (
-              <button
-                className="device-choice"
-                key={device.device_id}
-                onClick={() => void selectDevice(device.device_id)}
-                disabled={submitting}
-              >
-                <Laptop size={20} />
-                <span><strong>{device.device_name}</strong><code>{device.ip}</code></span>
-                <ChevronRight size={16} />
-              </button>
-            ))}
-          </div>
-        </Panel>
-      )}
+          <section className="agent-preset-grid">
+            {agents.map((agent) => {
+              const Icon = agent.icon;
+              return <button
+                  className="agent-preset"
+                  key={agent.id}
+                  onClick={() => void startRun(agent.prompt)}
+                  disabled={submitting || activeRun}
+                >
+                  <Icon size={27} />
+                  <span><strong>{agent.title}</strong>{agent.description}</span>
+                  <Play size={16} />
+                </button>;
+            })}
+          </section>
 
-      {run?.plan && (
-        <Panel className="agent-plan">
+          <section className="agent-workspace">
+            <Panel className="agent-chat">
+              <PanelTitle eyebrow="USER REQUEST" title="任务对话" />
+              <div className="agent-messages" ref={messageListRef}>
+                {historyCursor && (
+                  <button className="agent-load-earlier" disabled={threadLoading} onClick={() => void loadEarlier()}>
+                    {threadLoading ? "加载中…" : "加载更早的消息"}
+                  </button>
+                )}
+                {messages.map((item) => (
+                  <article className={`agent-message ${item.role}`} key={`${item.run_id}-${item.role}`}>
+                    <span>{item.role === "user" ? "你" : "Agent"}</span>
+                    {item.role === "assistant" ? (
+                      <AgentMarkdown content={item.content} />
+                    ) : (
+                      <p>{item.content}</p>
+                    )}
+                  </article>
+                ))}
+                {!messages.length && !threadLoading && (
+                  <EmptyState
+                    icon={Bot}
+                    title={selectedThreadId ? "这个会话还没有消息" : "描述一个同步任务"}
+                    description="例如：同步 PC-B 的 notes 文件夹。Agent 会先规划，不会直接传输。"
+                  />
+                )}
+              </div>
+              <form className="agent-composer" onSubmit={submit}>
+                <textarea
+                  aria-label="Agent 任务"
+                  value={message}
+                  onChange={(event) => setMessage(event.target.value)}
+                  placeholder={activeRun ? "请先等待当前任务完成" : "输入设备名称和目录，例如：同步 PC-B 的 notes 文件夹"}
+                  disabled={activeRun}
+                  rows={3}
+                />
+                <Button
+                  type="submit"
+                  icon={submitting ? LoaderCircle : Send}
+                  disabled={submitting || activeRun || !message.trim()}
+                >
+                  {submitting ? "提交中" : activeRun ? "任务处理中" : "发送任务"}
+                </Button>
+              </form>
+            </Panel>
+
+            <Panel className="agent-trace">
+              <PanelTitle eyebrow="REACT TRACE" title="最新一轮执行步骤" />
+              <div className="agent-run-head">
+                <Badge tone={agentStatusTone(run?.status)}>
+                  {run?.status === "waiting_approval" && !run.plan
+                    ? "等待选择"
+                    : agentStatusLabel(run?.status)}
+                </Badge>
+                {run && <code>{run.run_id.slice(0, 12)}</code>}
+              </div>
+              <div className="agent-timeline">
+                {run?.steps.map((step, index) => (
+                  <article className="agent-step" key={`${step.created_at_ns}-${index}`}>
+                    <span className={`step-dot ${step.status}`} />
+                    <div>
+                      <strong>{toolLabel(step.name)}</strong>
+                      <span>{step.kind} / {step.status}</span>
+                      {step.kind === "observation" && (
+                        <pre>{compactJson(step.output)}</pre>
+                      )}
+                    </div>
+                  </article>
+                ))}
+                {run && !run.steps.length && <p className="muted-copy">等待 Planner 启动。</p>}
+                {!run && <p className="muted-copy">发送消息后，这里会显示最新一轮执行过程。</p>}
+              </div>
+            </Panel>
+          </section>
+
+          {run?.status === "waiting_approval" && !run.plan && selectionDevices.length > 0 && (
+            <Panel>
+              <PanelTitle eyebrow="CLARIFICATION" title="请选择目标设备" />
+              <div className="device-choice-grid">
+                {selectionDevices.map((device) => (
+                  <button
+                    className="device-choice"
+                    key={device.device_id}
+                    onClick={() => void selectDevice(device.device_id)}
+                    disabled={submitting}
+                  >
+                    <Laptop size={20} />
+                    <span><strong>{device.device_name}</strong><code>{device.ip}</code></span>
+                    <ChevronRight size={16} />
+                  </button>
+                ))}
+              </div>
+            </Panel>
+          )}
+
+          {run?.plan && (
+            <Panel className="agent-plan">
           <PanelTitle
             eyebrow="SYNC PLAN"
             title={`${run.plan.device_name} / ${run.plan.path_prefix || "共享目录根目录"}`}
@@ -1373,17 +1735,23 @@ export function AgentsPage({
               </Button>
             </div>
           )}
-        </Panel>
-      )}
+            </Panel>
+          )}
+        </div>
+      </section>
 
       {error && (
         <ErrorState
           message={error}
-          retry={() => run ? void refresh(run.run_id) : setError("")}
+          retry={() => selectedThreadId ? openThread(selectedThreadId) : void fetchThreads()}
         />
       )}
     </Page>
   );
+}
+
+function isAgentRunActive(status?: AgentRun["status"] | ""): boolean {
+  return status === "queued" || status === "running" || status === "waiting_approval";
 }
 
 function AgentMarkdown({ content }: { content: string }) {

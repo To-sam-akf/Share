@@ -88,7 +88,36 @@ export interface AgentRun {
   updated_at_ns: number;
   steps: AgentStep[];
   plan: SyncPlan | null;
-  messages: Array<{ role: "user" | "assistant"; content: string }>;
+  messages: AgentMessage[];
+}
+
+export interface AgentMessage {
+  run_id: string;
+  role: "user" | "assistant";
+  content: string;
+  created_at_ns: number;
+}
+
+export interface AgentThreadSummary {
+  thread_id: string;
+  title: string;
+  latest_run_id: string;
+  status: AgentRunStatus | "";
+  run_count: number;
+  created_at_ns: number;
+  updated_at_ns: number;
+}
+
+export interface AgentThreadDetail {
+  thread: AgentThreadSummary;
+  messages: AgentMessage[];
+  latest_run: AgentRun | null;
+  next_cursor: string | null;
+}
+
+export interface AgentThreadPage {
+  items: AgentThreadSummary[];
+  next_cursor: string | null;
 }
 
 export interface AuditEvent {
@@ -170,6 +199,7 @@ export interface FileEntry {
     | "deleted_record"
     | "conflict"
     | "error";
+  preview_kind: "pdf" | "image" | "text" | null;
 }
 
 export interface Conflict {

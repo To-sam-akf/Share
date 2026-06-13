@@ -10,7 +10,7 @@ import uuid
 from contextlib import asynccontextmanager
 from http.cookies import SimpleCookie
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
 from fastapi.responses import FileResponse, JSONResponse
@@ -18,7 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from runtime import AppRuntime
+from runtime import AppRuntime, file_preview_kind
+from agents.store import AgentThreadActiveError
 from security import VALID_PERMISSIONS
 
 
@@ -210,6 +211,41 @@ def create_app(
             status=status,
         )
 
+    @app.get("/api/files/content")
+    async def get_file_content(
+        request: Request,
+        path: str,
+        disposition: Literal["inline", "attachment"] = "inline",
+    ):
+        session_id = request.cookies.get(SESSION_COOKIE)
+        if sessions.csrf_for(session_id) is None:
+            raise HTTPException(401, "需要有效的本地控制台会话。")
+        try:
+            entry, file_path = runtime.shared_file_path(path)
+        except ValueError as exc:
+            raise HTTPException(400, "文件路径无效。") from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(404, "文件不存在或不可访问。") from exc
+
+        preview_kind = file_preview_kind(entry.file_name)
+        response_disposition = (
+            "inline"
+            if disposition == "inline" and preview_kind is not None
+            else "attachment"
+        )
+        guessed_type, _ = mimetypes.guess_type(entry.file_name)
+        media_type = (
+            "text/plain; charset=utf-8"
+            if response_disposition == "inline" and preview_kind == "text"
+            else guessed_type or "application/octet-stream"
+        )
+        return FileResponse(
+            file_path,
+            media_type=media_type,
+            filename=entry.file_name,
+            content_disposition_type=response_disposition,
+        )
+
     @app.post("/api/sync/run")
     async def run_sync():
         if not runtime.config.sync_enabled:
@@ -340,6 +376,10 @@ def create_app(
                 str(body.get("message", "")),
                 str(body.get("thread_id", "")),
             )
+        except KeyError as exc:
+            raise HTTPException(404, "Agent 会话不存在。") from exc
+        except AgentThreadActiveError as exc:
+            raise HTTPException(409, "当前会话仍有任务正在处理。") from exc
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from exc
 
@@ -370,8 +410,51 @@ def create_app(
             raise HTTPException(409, str(exc)) from exc
 
     @app.get("/api/agent/threads")
-    async def get_agent_threads(limit: int = 50):
-        return {"items": runtime.react_agent.list_threads(limit)}
+    async def get_agent_threads(limit: int = 50, cursor: str = ""):
+        try:
+            return runtime.react_agent.list_threads(limit, cursor)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.get("/api/agent/threads/{thread_id}")
+    async def get_agent_thread(
+        thread_id: str,
+        limit: int = 50,
+        cursor: str = "",
+    ):
+        try:
+            payload = runtime.react_agent.get_thread(
+                thread_id,
+                limit=limit,
+                cursor=cursor,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if payload is None:
+            raise HTTPException(404, "Agent 会话不存在。")
+        return payload
+
+    @app.patch("/api/agent/threads/{thread_id}")
+    async def rename_agent_thread(thread_id: str, body: dict[str, Any]):
+        try:
+            return runtime.react_agent.rename_thread(
+                thread_id,
+                str(body.get("title", "")),
+            )
+        except KeyError as exc:
+            raise HTTPException(404, "Agent 会话不存在。") from exc
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+    @app.delete("/api/agent/threads/{thread_id}")
+    async def delete_agent_thread(thread_id: str):
+        try:
+            await runtime.react_agent.delete_thread(thread_id)
+        except KeyError as exc:
+            raise HTTPException(404, "Agent 会话不存在。") from exc
+        except AgentThreadActiveError as exc:
+            raise HTTPException(409, "活动中的 Agent 会话不能删除。") from exc
+        return {"status": "success", "thread_id": thread_id}
 
     @app.post("/api/agents/{agent_name}")
     async def run_agent(agent_name: str, body: dict[str, Any] | None = None):

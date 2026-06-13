@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -12,6 +13,14 @@ from urllib.parse import urlencode
 
 from runtime import AppRuntime, EventBus
 from webapp import CSRF_HEADER, create_app
+
+
+async def run_sync_inline_for_test(
+    func,
+    *args,
+    **_kwargs,
+):
+    return func(*args)
 
 
 def write_config(root: Path) -> Path:
@@ -211,6 +220,140 @@ class WebConsoleTests(unittest.TestCase):
         )
         self.assertEqual(list(upload_dir.iterdir()), [])
 
+    def test_shared_files_can_be_previewed_and_downloaded(self) -> None:
+        shared = self.runtime.config.shared_folder
+        folder = shared / "收到的文件"
+        folder.mkdir(parents=True)
+        samples = {
+            "报告 2026.pdf": (b"%PDF-1.7\nsample", "pdf", "inline"),
+            "photo.png": (b"\x89PNG\r\n\x1a\n", "image", "inline"),
+            "notes.txt": ("共享文本".encode(), "text", "inline"),
+            "page.html": (b"<script>alert(1)</script>", None, "attachment"),
+            "vector.svg": (b"<svg xmlns='http://www.w3.org/2000/svg'/>", None, "attachment"),
+        }
+        for name, (content, _, _) in samples.items():
+            (folder / name).write_bytes(content)
+
+        payload = self.request("GET", "/api/files").json()
+        by_name = {item["file_name"]: item for item in payload["items"]}
+        for name, (_, preview_kind, _) in samples.items():
+            self.assertEqual(by_name[name]["preview_kind"], preview_kind)
+
+        with mock.patch(
+            "anyio.to_thread.run_sync",
+            new=run_sync_inline_for_test,
+        ):
+            for name, (content, _, expected_disposition) in samples.items():
+                with self.subTest(name=name):
+                    response = self.request(
+                        "GET",
+                        "/api/files/content",
+                        query={
+                            "path": f"收到的文件/{name}",
+                            "disposition": "inline",
+                        },
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.body, content)
+                    self.assertIn(
+                        expected_disposition,
+                        response.headers["content-disposition"],
+                    )
+
+            download = self.request(
+                "GET",
+                "/api/files/content",
+                query={
+                    "path": "收到的文件/报告 2026.pdf",
+                    "disposition": "attachment",
+                },
+            )
+        self.assertEqual(download.status_code, 200)
+        self.assertIn("attachment", download.headers["content-disposition"])
+
+    def test_shared_file_content_requires_session_and_safe_active_path(self) -> None:
+        shared = self.runtime.config.shared_folder
+        shared.mkdir(parents=True, exist_ok=True)
+        active = shared / "active.txt"
+        active.write_text("0123456789", encoding="utf-8")
+        self.runtime.file_index.scan()
+
+        unauthenticated = asyncio.run(
+            asgi_request(
+                self.app,
+                "GET",
+                "/api/files/content",
+                query={"path": "active.txt"},
+            )
+        )
+        self.assertEqual(unauthenticated.status_code, 401)
+
+        for invalid_path in (
+            "../active.txt",
+            "/etc/passwd",
+            ".lan-sync/index.sqlite3",
+        ):
+            with self.subTest(path=invalid_path):
+                response = self.request(
+                    "GET",
+                    "/api/files/content",
+                    query={"path": invalid_path},
+                )
+                self.assertEqual(response.status_code, 400)
+
+        invalid_disposition = self.request(
+            "GET",
+            "/api/files/content",
+            query={"path": "active.txt", "disposition": "open"},
+        )
+        self.assertEqual(invalid_disposition.status_code, 422)
+
+        outside = self.root / "outside.txt"
+        outside.write_text("outside", encoding="utf-8")
+        link = shared / "link.txt"
+        try:
+            link.symlink_to(outside)
+        except (OSError, NotImplementedError):
+            pass
+        else:
+            linked = self.request(
+                "GET",
+                "/api/files/content",
+                query={"path": "link.txt"},
+            )
+            self.assertEqual(linked.status_code, 404)
+
+        active.unlink()
+        deleted = self.request(
+            "GET",
+            "/api/files/content",
+            query={"path": "active.txt"},
+        )
+        self.assertEqual(deleted.status_code, 404)
+        entry = self.runtime.file_index.get("active.txt")
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.status, "deleted")
+
+    def test_shared_file_content_supports_range_requests(self) -> None:
+        shared = self.runtime.config.shared_folder
+        shared.mkdir(parents=True, exist_ok=True)
+        (shared / "large.bin").write_bytes(b"0123456789")
+        self.runtime.file_index.scan()
+
+        with mock.patch(
+            "anyio.to_thread.run_sync",
+            new=run_sync_inline_for_test,
+        ):
+            response = self.request(
+                "GET",
+                "/api/files/content",
+                query={"path": "large.bin", "disposition": "attachment"},
+                headers={"Range": "bytes=2-5"},
+            )
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.body, b"2345")
+        self.assertEqual(response.headers["content-range"], "bytes 2-5/10")
+
     def test_transfer_observer(self) -> None:
         common = {
             "kind": "sync",
@@ -247,6 +390,64 @@ class WebConsoleTests(unittest.TestCase):
             json_body={"approved": "yes"},
         )
         self.assertEqual(invalid_decision.status_code, 422)
+
+    def test_agent_thread_api_lists_reads_renames_and_deletes(self) -> None:
+        store = self.runtime.react_agent.store
+        store.create_run("run-api", "thread-api", "Initial title")
+        store.update_run("run-api", status="completed", report="Done")
+
+        listed = self.request("GET", "/api/agent/threads", query={"limit": 10})
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(listed.json()["items"][0]["thread_id"], "thread-api")
+
+        detail = self.request("GET", "/api/agent/threads/thread-api")
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(len(detail.json()["messages"]), 2)
+
+        renamed = self.request(
+            "PATCH",
+            "/api/agent/threads/thread-api",
+            headers={CSRF_HEADER: self.csrf},
+            json_body={"title": "Renamed"},
+        )
+        self.assertEqual(renamed.status_code, 200)
+        self.assertEqual(renamed.json()["title"], "Renamed")
+
+        deleted = self.request(
+            "DELETE",
+            "/api/agent/threads/thread-api",
+            headers={CSRF_HEADER: self.csrf},
+        )
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(
+            self.request("GET", "/api/agent/threads/thread-api").status_code,
+            404,
+        )
+
+    def test_agent_thread_api_rejects_active_and_unknown_sessions(self) -> None:
+        store = self.runtime.react_agent.store
+        store.create_run("run-active", "thread-active", "Active")
+
+        conflict = self.request(
+            "POST",
+            "/api/agent/runs",
+            headers={CSRF_HEADER: self.csrf},
+            json_body={"message": "Second", "thread_id": "thread-active"},
+        )
+        self.assertEqual(conflict.status_code, 409)
+        missing = self.request(
+            "POST",
+            "/api/agent/runs",
+            headers={CSRF_HEADER: self.csrf},
+            json_body={"message": "Missing", "thread_id": "missing"},
+        )
+        self.assertEqual(missing.status_code, 404)
+        blocked_delete = self.request(
+            "DELETE",
+            "/api/agent/threads/thread-active",
+            headers={CSRF_HEADER: self.csrf},
+        )
+        self.assertEqual(blocked_delete.status_code, 409)
 
     def test_log_filters_accept_time_range(self) -> None:
         first = self.runtime.audit_store.record_event(
