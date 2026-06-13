@@ -1410,6 +1410,126 @@ select:focus {
   white-space: pre-wrap;
 }
 
+.agent-markdown {
+  min-width: 0;
+  margin-top: 7px;
+  color: #c1cddd;
+  font-size: 11px;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.agent-markdown > :first-child {
+  margin-top: 0;
+}
+
+.agent-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.agent-markdown h1,
+.agent-markdown h2,
+.agent-markdown h3,
+.agent-markdown h4 {
+  margin: 1.25em 0 0.55em;
+  color: var(--text);
+  line-height: 1.3;
+}
+
+.agent-markdown h1 {
+  font-size: 16px;
+}
+
+.agent-markdown h2 {
+  font-size: 14px;
+}
+
+.agent-markdown h3,
+.agent-markdown h4 {
+  font-size: 12px;
+}
+
+.agent-markdown p {
+  margin: 0.65em 0;
+  white-space: normal;
+}
+
+.agent-markdown ul,
+.agent-markdown ol {
+  margin: 0.65em 0;
+  padding-left: 1.8em;
+}
+
+.agent-markdown li + li {
+  margin-top: 0.25em;
+}
+
+.agent-markdown a {
+  color: #8fa0ff;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.agent-markdown blockquote {
+  margin: 0.8em 0;
+  border-left: 3px solid var(--primary);
+  padding: 0.15em 0 0.15em 0.9em;
+  color: #91a7c4;
+}
+
+.agent-markdown code {
+  border: 1px solid #2d405d;
+  border-radius: 2px;
+  background: #081321;
+  padding: 0.12em 0.35em;
+  color: #a9d5ff;
+  font-size: 0.95em;
+}
+
+.agent-markdown pre {
+  max-width: 100%;
+  margin: 0.8em 0;
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: #07111d;
+  padding: 10px 12px;
+}
+
+.agent-markdown pre code {
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: #b8cae0;
+}
+
+.agent-markdown table {
+  display: block;
+  width: 100%;
+  margin: 0.8em 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.agent-markdown th,
+.agent-markdown td {
+  border: 1px solid var(--line);
+  padding: 5px 8px;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.agent-markdown th {
+  background: #111f33;
+  color: var(--text);
+}
+
+.agent-markdown hr {
+  border: 0;
+  border-top: 1px solid var(--line);
+  margin: 1em 0;
+}
+
 .agent-composer {
   display: grid;
   grid-template-columns: 1fr auto;

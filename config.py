@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from dotenv import load_dotenv
+
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "device_name": "PC-A",
@@ -109,6 +111,7 @@ def ensure_default_config(path: str | Path = "config.json") -> Path:
 
 def load_config(path: str | Path = "config.json") -> AppConfig:
     config_path = ensure_default_config(path)
+    load_dotenv(config_path.parent / ".env", override=False)
     data = json.loads(config_path.read_text(encoding="utf-8"))
     config = AppConfig.from_mapping(data, config_path.parent)
     config.shared_folder.mkdir(parents=True, exist_ok=True)

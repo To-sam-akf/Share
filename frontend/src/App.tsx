@@ -46,6 +46,8 @@ import {
   useRef,
   useState
 } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { api, eventSocket, uploadFile } from "./api";
 import type {
   AgentResult,
@@ -1244,7 +1246,11 @@ export function AgentsPage({
             {run?.messages.map((item, index) => (
               <article className={`agent-message ${item.role}`} key={`${item.role}-${index}`}>
                 <span>{item.role === "user" ? "你" : "Agent"}</span>
-                <p>{item.content}</p>
+                {item.role === "assistant" ? (
+                  <AgentMarkdown content={item.content} />
+                ) : (
+                  <p>{item.content}</p>
+                )}
               </article>
             ))}
             {!run && (
@@ -1377,6 +1383,25 @@ export function AgentsPage({
         />
       )}
     </Page>
+  );
+}
+
+function AgentMarkdown({ content }: { content: string }) {
+  return (
+    <div className="agent-markdown">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ children, ...props }) => (
+            <a {...props} target="_blank" rel="noreferrer">
+              {children}
+            </a>
+          )
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
   );
 }
 

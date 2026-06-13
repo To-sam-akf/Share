@@ -3,6 +3,7 @@
 这是一个使用 Python Socket 实现的局域网文件共享与同步系统。当前包含阶段一至七的
 网络核心、LangGraph ReAct Agent，以及仅绑定本机的 React + FastAPI 管理控制台：
 
+![front end](./pic/frontier.png)
 - UDP 广播发现局域网设备。
 - TCP 单文件发送、SHA-256 校验、分块传输和断点续传。
 - 递归扫描共享目录并使用 SQLite 保存文件索引。

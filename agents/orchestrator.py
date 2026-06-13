@@ -135,9 +135,11 @@ class ReActSyncAgent:
                     {"run_id": run_id, "plan": plan},
                 )
         except Exception as exc:
+            report = "任务执行失败。请查看右侧执行步骤中的错误信息。"
             self.store.update_run(
                 run_id,
                 status="failed",
+                report=report,
                 error=f"{type(exc).__name__}: {exc}",
             )
             self.store.append_step(
@@ -149,7 +151,12 @@ class ReActSyncAgent:
             )
             self.runtime.events.publish(
                 "agent_completed",
-                {"run_id": run_id, "status": "failed", "error": str(exc)},
+                {
+                    "run_id": run_id,
+                    "status": "failed",
+                    "report": report,
+                    "error": str(exc),
+                },
             )
 
     def _build_graph(self, run_id: str, saver: AsyncSqliteSaver):
@@ -195,8 +202,16 @@ class ReActSyncAgent:
         request = state["request"]
         previous_plan_id = state.get("plan_id", "")
         analysis_only = self._is_analysis_request(request)
+        device_query_only = (
+            not analysis_only and self._is_device_query_request(request)
+        )
+        sync_action = self._is_sync_action_request(request)
+        conversation_only = (
+            not analysis_only and not device_query_only and not sync_action
+        )
+        read_only = analysis_only or device_query_only or conversation_only
         selected_device_id = ""
-        if not analysis_only:
+        if not read_only:
             selected, candidates = self.coordinator.device_candidates(request)
             if selected is None and len(candidates) > 1:
                 choices = [
@@ -260,41 +275,58 @@ class ReActSyncAgent:
                     + json.dumps(state["verification"], ensure_ascii=False)
                 )
             try:
-                react_agent = create_agent(
-                    model,
-                    self._tools(run_id),
-                    system_prompt=(
-                        "你是局域网文件同步 ReAct Planner。先调用工具获取事实，"
-                        "禁止猜测设备、路径或文件状态。一次任务只能选择一个远端设备"
-                        "和一个目录前缀。同步、上传或下载任务必须调用 "
-                        "generate_sync_plan 结束规划。若用户明确只要求连接诊断、"
-                        "冲突分析或安全审计，则只调用对应只读工具并直接回答。"
-                        "execute_sync_plan 需要人工审批，不要尝试绕过审批。"
-                    ),
-                    middleware=[
-                        ModelCallLimitMiddleware(
-                            thread_limit=12,
-                            exit_behavior="end",
-                        )
-                    ],
-                    name="lan-sync-planner",
-                )
-                response = await react_agent.ainvoke(
-                    {
-                        "messages": [HumanMessage(content=prompt)],
-                        "thread_model_call_count": state.get("model_calls", 0),
-                    },
-                    {"recursion_limit": 30},
-                )
-                model_calls = int(
-                    response.get(
-                        "thread_model_call_count",
-                        state.get("model_calls", 0),
+                if conversation_only:
+                    message = await model.ainvoke(
+                        [
+                            SystemMessage(
+                                content=(
+                                    "你是 LANSync Agent，负责局域网设备发现、连接诊断、"
+                                    "安全审计、冲突分析和文件同步规划。简洁回答身份、"
+                                    "能力或使用方式问题；不要声称已经执行工具或文件操作。"
+                                )
+                            ),
+                            HumanMessage(content=prompt),
+                        ]
                     )
-                )
-                messages = response.get("messages", [])
-                if messages:
-                    summary = str(getattr(messages[-1], "content", "") or "")
+                    model_calls = state.get("model_calls", 0) + 1
+                    summary = str(getattr(message, "content", "") or "")
+                else:
+                    react_agent = create_agent(
+                        model,
+                        self._tools(run_id),
+                        system_prompt=(
+                            "你是局域网文件同步 ReAct Planner。先调用工具获取事实，"
+                            "禁止猜测设备、路径或文件状态。一次任务只能选择一个远端设备"
+                            "和一个目录前缀。同步、上传或下载任务必须调用 "
+                            "generate_sync_plan 结束规划。若用户明确只要求连接诊断、"
+                            "冲突分析、安全审计或查看设备，则只调用对应只读工具并"
+                            "直接回答。查看设备时必须调用 discover_devices。"
+                            "execute_sync_plan 需要人工审批，不要尝试绕过审批。"
+                        ),
+                        middleware=[
+                            ModelCallLimitMiddleware(
+                                thread_limit=12,
+                                exit_behavior="end",
+                            )
+                        ],
+                        name="lan-sync-planner",
+                    )
+                    response = await react_agent.ainvoke(
+                        {
+                            "messages": [HumanMessage(content=prompt)],
+                            "thread_model_call_count": state.get("model_calls", 0),
+                        },
+                        {"recursion_limit": 30},
+                    )
+                    model_calls = int(
+                        response.get(
+                            "thread_model_call_count",
+                            state.get("model_calls", 0),
+                        )
+                    )
+                    messages = response.get("messages", [])
+                    if messages:
+                        summary = str(getattr(messages[-1], "content", "") or "")
             except Exception as exc:
                 model_calls = state.get("model_calls", 0)
                 self.store.append_step(
@@ -321,8 +353,24 @@ class ReActSyncAgent:
                 for step in run["steps"]
             )
         )
-        if analysis_only and (not summary or not used_analysis_tool):
-            summary = self._local_analysis_report(request)
+        used_device_tool = bool(
+            run
+            and any(
+                step["kind"] == "observation"
+                and step["name"] == "discover_devices"
+                and step["status"] == "success"
+                for step in run["steps"]
+            )
+        )
+        if conversation_only:
+            if not summary:
+                summary = self._local_conversation_report()
+        elif device_query_only:
+            if not summary or not used_device_tool:
+                summary = self._local_device_report(run_id)
+        elif analysis_only:
+            if not summary or not used_analysis_tool:
+                summary = self._local_analysis_report(request)
         elif not plan_id or (
             state.get("revision_count", 0) > 0 and plan_id == previous_plan_id
         ):
@@ -348,8 +396,8 @@ class ReActSyncAgent:
                 "model_calls",
                 state.get("model_calls", 0),
             ),
-            "analysis_only": analysis_only,
-            "report": summary if analysis_only else "",
+            "analysis_only": read_only,
+            "report": summary if read_only else "",
         }
 
     def _analysis_report_node(self, state: WorkflowState) -> WorkflowState:
@@ -766,6 +814,91 @@ class ReActSyncAgent:
             explicitly_read_only
             or not any(word in normalized for word in action_words)
         )
+
+    @staticmethod
+    def _is_device_query_request(request: str) -> bool:
+        normalized = request.lower()
+        device_words = ("设备", "终端", "主机", "节点", "device")
+        query_words = (
+            "列出",
+            "查看",
+            "查询",
+            "显示",
+            "有哪些",
+            "设备列表",
+            "谁在线",
+            "多少台",
+            "在线",
+        )
+        action_words = (
+            "同步",
+            "上传",
+            "下载",
+            "传输",
+            "发送文件",
+            "配对",
+            "诊断",
+            "审计",
+            "冲突",
+        )
+        return (
+            any(word in normalized for word in device_words)
+            and any(word in normalized for word in query_words)
+            and not any(word in normalized for word in action_words)
+        )
+
+    @staticmethod
+    def _is_sync_action_request(request: str) -> bool:
+        normalized = request.lower()
+        action_words = (
+            "同步",
+            "上传",
+            "下载",
+            "传输",
+            "发送文件",
+            "sync",
+            "upload",
+            "download",
+            "transfer",
+        )
+        return any(word in normalized for word in action_words)
+
+    @staticmethod
+    def _local_conversation_report() -> str:
+        return (
+            "我是 LANSync Agent，负责局域网设备发现、连接诊断、安全审计、"
+            "冲突分析和文件同步规划。文件传输前我会先生成计划，并等待你批准。"
+        )
+
+    def _local_device_report(self, run_id: str) -> str:
+        devices = self.coordinator.discover_devices()
+        self.store.append_step(
+            run_id,
+            kind="observation",
+            name="discover_devices",
+            status="success",
+            output_data=devices,
+        )
+        online = [device for device in devices if device.get("online")]
+        if not online:
+            return (
+                "暂未发现其他在线设备。请确认对方程序已启动，"
+                "且防火墙允许 UDP 广播。"
+            )
+
+        lines = [f"发现 {len(online)} 台在线设备："]
+        for device in online:
+            address = str(device.get("ip") or "地址未知")
+            if device.get("tcp_port") is not None:
+                address += f":{device['tcp_port']}"
+            pairing = "已配对" if device.get("paired") else "未配对"
+            permission = str(device.get("permission") or "未知")
+            tls = "已启用" if device.get("tls_enabled") else "未启用"
+            lines.append(
+                f"- {device.get('device_name') or device.get('device_id')} "
+                f"（{address}，{pairing}，权限：{permission}，TLS：{tls}）"
+            )
+        return "\n".join(lines)
 
     def _local_analysis_report(self, request: str) -> str:
         if "安全" in request or "审计" in request:

@@ -17,6 +17,7 @@ from agents import (
     ConflictAnalysisAgent,
     ConnectionDiagnosticAgent,
     SecurityAuditAgent,
+    create_chat_model,
 )
 from audit import AuditStore
 from discovery import DiscoveredDevice
@@ -467,6 +468,27 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("private_path", user_payload["facts"])
         self.assertTrue(enhanced.enhanced)
         self.assertEqual(enhanced.summary, "enhanced")
+
+    def test_chat_model_uses_provider_specific_api_key(self) -> None:
+        values = {
+            "OPENAI_API_KEY": "openai-key",
+            "DEEPSEEK_API_KEY": "deepseek-key",
+        }
+        common = {
+            "agent_api_url": "",
+            "agent_model": "test-model",
+            "agent_timeout_seconds": 20,
+        }
+        with (
+            patch.dict(os.environ, values, clear=True),
+            patch("agents.model_factory.ChatOpenAI") as openai,
+            patch("agents.model_factory.ChatDeepSeek") as deepseek,
+        ):
+            create_chat_model(SimpleNamespace(agent_provider="openai", **common))
+            create_chat_model(SimpleNamespace(agent_provider="deepseek", **common))
+
+        self.assertEqual(openai.call_args.kwargs["api_key"], "openai-key")
+        self.assertEqual(deepseek.call_args.kwargs["api_key"], "deepseek-key")
 
 
 if __name__ == "__main__":

@@ -176,4 +176,49 @@ describe("LANSync console pages", () => {
       )
     );
   });
+
+  it("renders Agent replies as safe GitHub-flavored Markdown", async () => {
+    const markdownRun: AgentRun = {
+      ...agentRun,
+      status: "completed",
+      plan_id: null,
+      plan: null,
+      messages: [
+        agentRun.messages[0],
+        {
+          role: "assistant",
+          content: [
+            "## 同步结果",
+            "",
+            "- **状态**：完成",
+            "- 路径：`notes/report.md`",
+            "",
+            "| 文件 | 结果 |",
+            "| --- | --- |",
+            "| report.md | 成功 |",
+            "",
+            "[查看文档](https://example.com/docs)",
+            "",
+            "<script>alert('unsafe')</script>"
+          ].join("\n")
+        }
+      ]
+    };
+    apiMock.mockResolvedValue(markdownRun);
+
+    const { container } = render(<AgentsPage notify={notify} />);
+    fireEvent.change(screen.getByRole("textbox", { name: "Agent 任务" }), {
+      target: { value: "查看同步结果" }
+    });
+    fireEvent.click(screen.getByRole("button", { name: "发送任务" }));
+
+    expect(await screen.findByRole("heading", { name: "同步结果" })).toBeInTheDocument();
+    expect(screen.getByText("notes/report.md").tagName).toBe("CODE");
+    expect(screen.getByRole("table")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "查看文档" })).toHaveAttribute(
+      "target",
+      "_blank"
+    );
+    expect(container.querySelector("script")).toBeNull();
+  });
 });

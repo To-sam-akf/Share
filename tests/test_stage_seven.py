@@ -25,6 +25,16 @@ class ToolCallingFakeModel(FakeMessagesListChatModel):
         return self
 
 
+class FailingChatModel:
+    async def ainvoke(self, messages):
+        raise RuntimeError("AuthenticationError: invalid API key")
+
+
+class SuccessfulChatModel:
+    async def ainvoke(self, messages):
+        return AIMessage(content="我是模型生成的 LANSync Agent 回答。")
+
+
 class StaticDiscovery:
     def __init__(self, devices=None) -> None:
         self.devices = list(devices or [])
@@ -34,6 +44,14 @@ class StaticDiscovery:
 
 
 class StageSevenSyncAgentTests(unittest.TestCase):
+    def test_connection_diagnosis_takes_priority_over_device_listing(self) -> None:
+        self.assertTrue(ReActSyncAgent._is_analysis_request("诊断在线设备"))
+        self.assertFalse(ReActSyncAgent._is_device_query_request("诊断在线设备"))
+
+    def test_identity_question_is_not_treated_as_sync_action(self) -> None:
+        self.assertFalse(ReActSyncAgent._is_sync_action_request("你是谁"))
+        self.assertTrue(ReActSyncAgent._is_sync_action_request("同步 PC-B 的 notes"))
+
     def test_path_prefix_rejects_traversal_and_wildcards(self) -> None:
         self.assertEqual(normalize_path_prefix("notes/research"), "notes/research")
         self.assertEqual(normalize_path_prefix(""), "")
@@ -342,6 +360,138 @@ class StageSevenSyncAgentTests(unittest.TestCase):
                     if task is None or task.done():
                         break
                     await asyncio.sleep(0.02)
+
+        asyncio.run(scenario())
+
+    def test_device_list_request_finishes_without_sync_plan(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = SimpleNamespace(
+                    config=SimpleNamespace(shared_folder=Path(tmp)),
+                    events=SimpleNamespace(publish=lambda *_: None),
+                    devices_payload=lambda: [
+                        {
+                            "device_id": "device-b",
+                            "device_name": "PC-B",
+                            "online": True,
+                            "ip": "192.168.1.8",
+                            "tcp_port": 9001,
+                            "paired": False,
+                            "permission": "unpaired",
+                            "tls_enabled": True,
+                        },
+                        {
+                            "device_id": "device-c",
+                            "device_name": "PC-C",
+                            "online": False,
+                            "ip": "",
+                            "tcp_port": None,
+                            "paired": True,
+                            "permission": "write",
+                            "tls_enabled": True,
+                        },
+                    ],
+                )
+                agent = ReActSyncAgent(runtime)
+                with patch("agents.orchestrator.create_chat_model", return_value=None):
+                    created = agent.create_run("请列出在线设备")
+                    for _ in range(100):
+                        await asyncio.sleep(0.02)
+                        current = agent.get_run(created["run_id"])
+                        if current["status"] == "completed":
+                            break
+
+                self.assertEqual(current["status"], "completed")
+                self.assertIsNone(current["plan"])
+                self.assertIn("发现 1 台在线设备", current["report"])
+                self.assertIn("PC-B", current["report"])
+                self.assertNotIn("PC-C", current["report"])
+                self.assertTrue(
+                    any(
+                        step["name"] == "discover_devices"
+                        and step["status"] == "success"
+                        for step in current["steps"]
+                    )
+                )
+                for _ in range(100):
+                    task = agent._tasks.get(created["run_id"])
+                    if task is None or task.done():
+                        break
+                    await asyncio.sleep(0.02)
+
+        asyncio.run(scenario())
+
+    def test_identity_question_falls_back_when_model_authentication_fails(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = SimpleNamespace(
+                    config=SimpleNamespace(shared_folder=Path(tmp)),
+                    events=SimpleNamespace(publish=lambda *_: None),
+                )
+                agent = ReActSyncAgent(runtime)
+                agent.store.create_run("run-identity", "thread-identity", "你是谁")
+                with patch(
+                    "agents.orchestrator.create_chat_model",
+                    return_value=FailingChatModel(),
+                ):
+                    state = await agent._planner_node(
+                        {
+                            "run_id": "run-identity",
+                            "request": "你是谁",
+                            "revision_count": 0,
+                            "model_calls": 0,
+                        }
+                    )
+                agent._analysis_report_node(
+                    {
+                        "run_id": "run-identity",
+                        "report": state["report"],
+                    }
+                )
+                current = agent.get_run("run-identity")
+
+                self.assertEqual(current["status"], "completed")
+                self.assertIsNone(current["plan"])
+                self.assertIn("我是 LANSync Agent", current["report"])
+                self.assertEqual(current["messages"][-1]["role"], "assistant")
+                self.assertTrue(
+                    any(
+                        step["name"] == "model_fallback"
+                        and step["status"] == "warning"
+                        for step in current["steps"]
+                    )
+                )
+
+        asyncio.run(scenario())
+
+    def test_identity_question_returns_successful_model_answer_without_plan(self) -> None:
+        async def scenario() -> None:
+            with tempfile.TemporaryDirectory() as tmp:
+                runtime = SimpleNamespace(
+                    config=SimpleNamespace(shared_folder=Path(tmp)),
+                    events=SimpleNamespace(publish=lambda *_: None),
+                )
+                agent = ReActSyncAgent(runtime)
+                agent.store.create_run("run-model", "thread-model", "你是谁")
+                with patch(
+                    "agents.orchestrator.create_chat_model",
+                    return_value=SuccessfulChatModel(),
+                ):
+                    state = await agent._planner_node(
+                        {
+                            "run_id": "run-model",
+                            "request": "你是谁",
+                            "revision_count": 0,
+                            "model_calls": 0,
+                        }
+                    )
+
+                self.assertEqual(state["plan_id"], "")
+                self.assertTrue(state["analysis_only"])
+                self.assertEqual(
+                    state["report"],
+                    "我是模型生成的 LANSync Agent 回答。",
+                )
 
         asyncio.run(scenario())
 

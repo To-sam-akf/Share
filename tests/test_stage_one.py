@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from config import load_config
 from transfer import TCPFileServer, send_file
@@ -37,6 +39,34 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.sync_enabled)
             self.assertEqual(config.sync_interval_seconds, 10.0)
             self.assertTrue(config.shared_folder.is_dir())
+
+    def test_load_config_reads_dotenv_without_overriding_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            (root / ".env").write_text(
+                "DEEPSEEK_API_KEY=from-dotenv\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {}, clear=True):
+                load_config(config_path)
+                self.assertEqual(
+                    os.environ.get("DEEPSEEK_API_KEY"),
+                    "from-dotenv",
+                )
+
+            with patch.dict(
+                os.environ,
+                {"DEEPSEEK_API_KEY": "from-environment"},
+                clear=True,
+            ):
+                load_config(config_path)
+                self.assertEqual(
+                    os.environ.get("DEEPSEEK_API_KEY"),
+                    "from-environment",
+                )
 
 
 class TCPTransferTests(unittest.TestCase):
